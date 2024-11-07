@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
+	"github.com/jroimartin/gocui"
 	"github.com/mjibson/go-dsp/fft"
 	"github.com/mjibson/go-dsp/window"
 	"github.com/pion/webrtc/v3"
@@ -35,7 +36,7 @@ const (
 	LogAll      = LogError | LogInfo | LogSamples | LogDetailed
 )
 
-var debugLevel = LogInfo // Default to errors only
+var debugLevel = LogDetailed // Default to errors only
 
 type SignalingMessage struct {
 	Type      string                   `json:"type"`
@@ -44,11 +45,47 @@ type SignalingMessage struct {
 }
 
 type AudioProcessor struct {
-	samples    []float64
-	sampleLock sync.Mutex
-	windowSize int
-	sampleRate float64
-	stream     *portaudio.Stream
+	samples       []float64
+	sampleLock    sync.Mutex
+	windowSize    int
+	sampleRate    float64
+	stream        *portaudio.Stream
+	gui           *gocui.Gui
+	currentFreq   float64
+	currentNote   string
+	rms           float64
+	peakToNoise   float64
+	logMessages   []string
+	logLock       sync.Mutex
+}
+
+// Custom logger that writes to the TUI
+func (ap *AudioProcessor) log(format string, args ...interface{}) {
+	ap.logLock.Lock()
+	defer ap.logLock.Unlock()
+	
+	msg := fmt.Sprintf(format, args...)
+	ap.logMessages = append(ap.logMessages, msg)
+	
+	// Keep only last 1000 messages
+	if len(ap.logMessages) > 1000 {
+		ap.logMessages = ap.logMessages[len(ap.logMessages)-1000:]
+	}
+	
+	// Update log view if GUI is available
+	if ap.gui != nil {
+		ap.gui.Update(func(g *gocui.Gui) error {
+			v, err := g.View("logs")
+			if err != nil {
+				return err
+			}
+			v.Clear()
+			for _, msg := range ap.logMessages {
+				fmt.Fprintln(v, msg)
+			}
+			return nil
+		})
+	}
 }
 
 type WebRTCConnection struct {
@@ -194,7 +231,7 @@ func (ap *AudioProcessor) processAudioTrack(track *webrtc.TrackRemote) {
 			}
 			
 			if err := ap.stream.Write(); err != nil {
-				fmt.Printf("Error writing to audio output: %v\n", err)
+				ap.log("Error writing to audio output: %v", err)
 			}
 		}
 		
@@ -654,10 +691,170 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func layout(g *gocui.Gui) error {
+	maxX, maxY := g.Size()
+	
+	// Create waveform view
+	if v, err := g.SetView("waveform", 0, 0, maxX-1, maxY-1); err != nil {
+		if err != gocui.ErrUnknownView {
+			return err
+		}
+		v.Title = "Waveform"
+		v.Wrap = false
+		v.Frame = true
+		
+		// Set initial content
+		fmt.Fprintln(v, "Waveform View")
+		fmt.Fprintln(v, "Waiting for audio input...")
+		
+		// Make it the current view and bring it to top
+		g.SetCurrentView("waveform")
+		g.SetViewOnTop("waveform")
+	}
+
+	// Create info view (initially hidden)
+	if v, err := g.SetView("info", 0, 0, maxX-1, maxY-1); err != nil {
+		if err != gocui.ErrUnknownView {
+			return err
+		}
+		v.Title = "Information"
+		v.Wrap = true
+		v.Frame = true
+		
+		// Set initial content
+		fmt.Fprintln(v, "Information View")
+		fmt.Fprintln(v, "Press Tab to switch views")
+		fmt.Fprintln(v, "Press Ctrl+C to quit")
+		
+		// Hide it initially
+		g.SetViewOnBottom("info")
+	}
+
+	// Create logs view (initially hidden)
+	if v, err := g.SetView("logs", 0, 0, maxX-1, maxY-1); err != nil {
+		if err != gocui.ErrUnknownView {
+			return err
+		}
+		v.Title = "Logs"
+		v.Wrap = true
+		v.Frame = true
+		
+		// Hide it initially
+		g.SetViewOnBottom("logs")
+	}
+
+	return nil
+}
+
+func nextView(g *gocui.Gui, v *gocui.View) error {
+	views := []string{"waveform", "info", "logs"}
+	currentView := g.CurrentView()
+	
+	// Find current view index
+	currentIndex := 0
+	for i, name := range views {
+		if currentView != nil && currentView.Name() == name {
+			currentIndex = i
+			break
+		}
+	}
+	
+	// Calculate next view index
+	nextIndex := (currentIndex + 1) % len(views)
+	nextViewName := views[nextIndex]
+
+	// Hide all views first
+	for _, name := range views {
+		if view, err := g.View(name); err == nil {
+			// Clear the view completely
+			view.Clear()
+			view.SetOrigin(0, 0)
+			view.SetCursor(0, 0)
+			
+			// Clear the buffer
+			view.Buffer()
+			
+			view.Frame = false
+			g.SetViewOnBottom(name)
+		}
+	}
+
+	// Show and setup the next view
+	if nextView, err := g.View(nextViewName); err == nil {
+		// Clear the view completely
+		nextView.Clear()
+		nextView.SetOrigin(0, 0)
+		nextView.SetCursor(0, 0)
+		
+		// Clear the buffer
+		nextView.Buffer()
+		
+		nextView.Frame = true
+		g.SetViewOnTop(nextViewName)
+		g.SetCurrentView(nextViewName)
+
+		// Redraw content based on view type
+		switch nextViewName {
+		case "logs":
+			if processor != nil {
+				processor.logLock.Lock()
+				for _, msg := range processor.logMessages {
+					fmt.Fprintln(nextView, msg)
+				}
+				processor.logLock.Unlock()
+			}
+		case "info":
+			fmt.Fprintln(nextView, "Information View")
+			fmt.Fprintln(nextView, "Press Tab to switch views")
+			fmt.Fprintln(nextView, "Press Ctrl+C to quit")
+		case "waveform":
+			fmt.Fprintln(nextView, "Waveform View")
+			fmt.Fprintln(nextView, "Waiting for audio input...")
+		}
+	}
+	
+	return nil
+}
+
+func quit(g *gocui.Gui, v *gocui.View) error {
+	return gocui.ErrQuit
+}
+
+var processor *AudioProcessor
+
 func main() {
-	http.HandleFunc("/websocket", handleWebSocket)
-	fmt.Println("Server starting on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	// Initialize GUI
+	g, err := gocui.NewGui(gocui.OutputNormal)
+	if err != nil {
+		panic(err)
+	}
+	defer g.Close()
+
+	// Create audio processor
+	processor = NewAudioProcessor()
+	processor.gui = g
+
+	g.SetManagerFunc(layout)
+	
+	// Set up key bindings
+	if err := g.SetKeybinding("", gocui.KeyCtrlC, gocui.ModNone, quit); err != nil {
+		panic(err)
+	}
+	if err := g.SetKeybinding("", gocui.KeyTab, gocui.ModNone, nextView); err != nil {
+		panic(err)
+	}
+
+	// Start HTTP server in a goroutine
+	go func() {
+		http.HandleFunc("/websocket", handleWebSocket)
+		processor.log("Server starting on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			processor.log("HTTP server error: %v", err)
+			panic(err)
+		}
+	}()
+
+	if err := g.MainLoop(); err != nil && err != gocui.ErrQuit {
 		panic(err)
 	}
 }
