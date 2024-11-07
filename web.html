@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebRTC Audio Client</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+    <h1>WebRTC Audio Client</h1>
+    <button id="startButton">Start Audio</button>
+    <button id="stopButton" disabled>Stop Audio</button>
+    
+    <div id="debugLog" style="margin-top: 20px; padding: 10px; border: 1px solid #ccc; min-height: 400px; overflow-y: scroll;">
+        <strong>Debug Log:</strong><br>
+    </div>
+
+    <script>
+        // Debug logging function
+        function log(message) {
+            const debugLog = document.getElementById('debugLog');
+            const timestamp = new Date().toLocaleTimeString();
+            debugLog.innerHTML += `${timestamp}: ${message}<br>`;
+            debugLog.scrollTop = debugLog.scrollHeight;
+            console.log(`${timestamp}: ${message}`);
+        }
+        let peerConnection;
+        let stream;
+
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+
+        startButton.onclick = startAudio;
+        stopButton.onclick = stopAudio;
+
+        async function startAudio() {
+            try {
+                log('Requesting audio access...');
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                log('Audio access granted');
+                startButton.disabled = true;
+                stopButton.disabled = false;
+
+                log('Creating RTCPeerConnection');
+                peerConnection = new RTCPeerConnection();
+                
+                // Add connection state change logging
+                peerConnection.onconnectionstatechange = () => {
+                    log(`Connection state changed to: ${peerConnection.connectionState}`);
+                };
+                
+                peerConnection.oniceconnectionstatechange = () => {
+                    log(`ICE connection state changed to: ${peerConnection.iceConnectionState}`);
+                };
+
+                stream.getTracks().forEach(track => {
+                    peerConnection.addTrack(track, stream);
+                    log(`Added audio track: ${track.label}`);
+                });
+
+                log('Creating offer...');
+                const offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+                
+                // Wait a bit to ensure the local description is fully set
+                await new Promise(resolve => setTimeout(resolve, 100));
+                
+                // Send the offer to the server
+                log('Sending offer to server...');
+                sendToServer({
+                    type: 'offer',
+                    sdp: offer.sdp
+                });
+
+                peerConnection.onicecandidate = event => {
+                    if (event.candidate) {
+                        log(`New ICE candidate: ${event.candidate.candidate}`);
+                        // Send the ICE candidate to the server
+                        sendToServer({
+                            type: 'ice-candidate',
+                            candidate: event.candidate
+                        });
+                    }
+                };
+
+                
+            } catch (err) {
+                log(`Error accessing audio: ${err.message}`);
+                console.error('Error accessing audio:', err);
+            }
+        }
+
+        function stopAudio() {
+            if (stream) {
+                log('Stopping audio tracks...');
+                stream.getTracks().forEach(track => {
+                    track.stop();
+                    log(`Stopped track: ${track.label}`);
+                });
+                stream = null;
+            }
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            startButton.disabled = false;
+            stopButton.disabled = true;
+        }
+
+        let pendingMessages = [];
+        let ws = null;
+
+        function sendToServer(data) {
+            if (!ws) {
+                initWebSocket();
+            }
+            
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(data));
+                log(`Sent to server: ${JSON.stringify(data)}`);
+            } else {
+                log('WebSocket not ready, queueing message');
+                pendingMessages.push(data);
+            }
+        }
+
+        function initWebSocket() {
+            if (ws !== null) {
+                return ws;
+            }
+            
+            const serverUrl = 'ws://localhost:8080/websocket';
+            ws = new WebSocket(serverUrl);
+            
+            ws.onopen = () => {
+                log('WebSocket connected to server');
+                // Send any pending messages
+                while (pendingMessages.length > 0) {
+                    const data = pendingMessages.shift();
+                    ws.send(JSON.stringify(data));
+                    log(`Sent pending message to server: ${JSON.stringify(data)}`);
+                }
+            };
+
+            ws.onerror = (error) => {
+                log(`WebSocket error: ${error.message}`);
+            };
+
+            ws.onclose = () => {
+                log('WebSocket connection closed');
+                ws = null;
+            };
+
+            ws.onmessage = async (event) => {
+                const message = JSON.parse(event.data);
+                log(`Received message type: ${message.type}`);
+                
+                try {
+                    if (message.type === 'answer') {
+                        log('Setting remote description from answer');
+                        const answerDesc = new RTCSessionDescription({
+                            type: 'answer',
+                            sdp: message.sdp
+                        });
+                        await peerConnection.setRemoteDescription(answerDesc);
+                        log('Remote description set successfully');
+                    } else if (message.type === 'ice-candidate') {
+                        log('Adding ICE candidate from server');
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                        log('ICE candidate added successfully');
+                    }
+                } catch (error) {
+                    log(`Error handling message: ${error.message}`);
+                }
+            };
+        }
+    </script>
+</body>
+</html>
